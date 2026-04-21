@@ -10,4 +10,4 @@ torchvision==0.17.2
 streamlit
 
 opencv-python
-pytorch-grad-cam
+grad-cam
