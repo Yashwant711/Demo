@@ -33,14 +33,19 @@ from torchvision.transforms import InterpolationMode
 from torchvision.models import inception_v3, Inception_V3_Weights
 import streamlit as st
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Capture exactly why GradCAM is failing to import
+# ─────────────────────────────────────────────────────────────────────────────
 try:
     import cv2
     from pytorch_grad_cam import GradCAM
     from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
     from pytorch_grad_cam.utils.image import show_cam_on_image
     HAS_GRADCAM = True
-except ImportError:
+    GRADCAM_ERR = ""
+except Exception as e:
     HAS_GRADCAM = False
+    GRADCAM_ERR = f"{type(e).__name__}: {str(e)}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ── PAGE CONFIG  (must be the very first Streamlit call) ──────────────────────
@@ -962,26 +967,32 @@ if should_run:
 
             if use_images and active_model is not None:
                 p_idx = CLASSES.index(pred)
-                if selected_derm and gc1:
-                    cam_d = generate_gradcam(active_model, derm_p, clinic_p, tab_cat_p, tab_num_p, p_idx, "derm")
-                    if cam_d is not None:
-                        gc1.image(
-                            show_cam_on_image(
-                                np.float32(Image.open(selected_derm).convert("RGB").resize((IMG_SIZE, IMG_SIZE))) / 255.0,
-                                cam_d, use_rgb=True,
-                            ),
-                            caption="Dermoscopy Focus", width="stretch",
-                        )
-                if selected_clinic and gc2:
-                    cam_c = generate_gradcam(active_model, derm_p, clinic_p, tab_cat_p, tab_num_p, p_idx, "clinic")
-                    if cam_c is not None:
-                        gc2.image(
-                            show_cam_on_image(
-                                np.float32(Image.open(selected_clinic).convert("RGB").resize((IMG_SIZE, IMG_SIZE))) / 255.0,
-                                cam_c, use_rgb=True,
-                            ),
-                            caption="Clinical Focus", width="stretch",
-                        )
+                
+                # Check for GradCAM availability and show explicit warnings if missing
+                if not HAS_GRADCAM:
+                    if gc1: gc1.error(f"GradCAM Import Failed: {GRADCAM_ERR}")
+                    if gc2: gc2.info("Ensure 'grad-cam' and 'opencv-python-headless' are correctly installed in your deployment environment.")
+                else:
+                    if selected_derm and gc1:
+                        cam_d = generate_gradcam(active_model, derm_p, clinic_p, tab_cat_p, tab_num_p, p_idx, "derm")
+                        if cam_d is not None:
+                            gc1.image(
+                                show_cam_on_image(
+                                    np.float32(Image.open(selected_derm).convert("RGB").resize((IMG_SIZE, IMG_SIZE))) / 255.0,
+                                    cam_d, use_rgb=True,
+                                ),
+                                caption="Dermoscopy Focus", width="stretch",
+                            )
+                    if selected_clinic and gc2:
+                        cam_c = generate_gradcam(active_model, derm_p, clinic_p, tab_cat_p, tab_num_p, p_idx, "clinic")
+                        if cam_c is not None:
+                            gc2.image(
+                                show_cam_on_image(
+                                    np.float32(Image.open(selected_clinic).convert("RGB").resize((IMG_SIZE, IMG_SIZE))) / 255.0,
+                                    cam_c, use_rgb=True,
+                                ),
+                                caption="Clinical Focus", width="stretch",
+                            )
 
             if use_tabular and gc3 and active_model is not None:
                 tab_attn = get_tabular_attention(active_model, derm_p, clinic_p, tab_cat_p, tab_num_p)
