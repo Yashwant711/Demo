@@ -1,0 +1,19 @@
+# Core
+numpy
+pandas
+scikit-learn
+joblib
+pillow
+
+# PyTorch (CPU only)
+torch==2.2.2+cpu
+torchvision==0.17.2+cpu
+torchaudio==2.2.2+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# App
+streamlit
+
+# Optional (only if you want Grad-CAM support)
+opencv-python
+pytorch-grad-cam
