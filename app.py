@@ -745,7 +745,7 @@ with st.sidebar:
 
     # ── OOD Controls ──────────────────────────────────────────────────────────
     st.markdown("<div class='section-label'>🛠️ ABLATION / OOD TESTING</div>", unsafe_allow_html=True)
-    blur_sigma   = st.slider("Image Blur (σ)", 0.0, 10.0, 0.0, step=0.5, key="blur_sigma")
+    blur_sigma   = st.slider("Image Blur (σ)", 0.0, 5.0, 0.0, step=0.1, key="blur_sigma")
     tab_mask_pct = st.slider("Tabular Masking (%)", 0, 100, 0, step=10, key="tab_mask_pct")
     st.markdown("<hr>", unsafe_allow_html=True)
 
