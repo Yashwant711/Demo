@@ -53,63 +53,44 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS
+# CONSTANTS & CONFIGURATION
+# (Must be defined before the classes to avoid ReferenceErrors)
 # ─────────────────────────────────────────────────────────────────────────────
 DERM_DIR       = Path("./test_images/derm")
 CLINIC_DIR     = Path("./test_images/clinical")
 PREPROCESSOR   = Path("./tabular_preprocessor.pkl")
-MODEL_FULL_PATH= Path("./model_full.pt")     # For standard inference (Clean)
-MODEL_OOD_PATH = Path("./model.pt")          # For OOD testing (Perturbed)
-META_PATH      = Path("./meta.csv")          # path to the metadata CSV
-TEST_IDX_PATH  = Path("./test_indexes.csv")  # path to the test indexes CSV
+MODEL_FULL_PATH= Path("./model_full.pt")     
+MODEL_OOD_PATH = Path("./model.pt")          
+META_PATH      = Path("./meta.csv")          
+TEST_IDX_PATH  = Path("./test_indexes.csv")  
 
-# UPDATED: Matches the alphabetical order of LabelEncoder from training
 CLASSES        = ["BCC", "MEL", "MISC", "NEV", "SK"]
-# UPDATED: Matches CFG.IMG_SIZE from training
 IMG_SIZE       = 299
 IMG_MEAN       = [0.485, 0.456, 0.406]
 IMG_STD        = [0.229, 0.224, 0.225]
 
 CAT_COLS = [
-    "vascular_structures",
-    "blue_whitish_veil",
-    "pigment_network",
-    "management",
-    "streaks",
-    "dots_and_globules",
-    "elevation",
-    "regression_structures",
-    "pigmentation",
-    "level_of_diagnostic_difficulty",
+    "vascular_structures", "blue_whitish_veil", "pigment_network",
+    "management", "streaks", "dots_and_globules", "elevation",
+    "regression_structures", "pigmentation", "level_of_diagnostic_difficulty",
     "location",
 ]
 NUM_COLS = ["seven_point_score"]
 
 SHORT_COLS = {
-    "vascular_structures": "vascular",
-    "blue_whitish_veil": "blue veil",
-    "pigment_network": "pigment",
-    "management": "management",
-    "streaks": "streaks",
-    "dots_and_globules": "dots",
-    "elevation": "elevation",
-    "regression_structures": "regression",
-    "pigmentation": "pigmentation",
-    "level_of_diagnostic_difficulty": "difficulty",
-    "location": "location",
-    "seven_point_score": "score"
+    "vascular_structures": "vascular", "blue_whitish_veil": "blue veil",
+    "pigment_network": "pigment", "management": "management",
+    "streaks": "streaks", "dots_and_globules": "dots",
+    "elevation": "elevation", "regression_structures": "regression",
+    "pigmentation": "pigmentation", "level_of_diagnostic_difficulty": "difficulty",
+    "location": "location", "seven_point_score": "score"
 }
 
-# ── class colour map for the probability chart ────────────────────────────────
 CLASS_COLORS = {
-    "BCC":  "#00e5ff",
-    "MEL":  "#ff4081",
-    "NEV":  "#69ff47",
-    "SK":   "#ffd740",
-    "MISC": "#b388ff",
+    "BCC":  "#00e5ff", "MEL":  "#ff4081", "NEV":  "#69ff47",
+    "SK":   "#ffd740", "MISC": "#b388ff",
 }
 
-# ── Architecture Configuration ──────────────────────────────────────────────
 class CFG:
     R_DIM        = 512
     EMB_DIM      = 16
@@ -124,6 +105,178 @@ class CFG:
     DROP_PROB    = 0.15
     NUM_COLS     = NUM_COLS
     CAT_COLS     = CAT_COLS
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSTOM CLASSES (Moved to top to prevent unpickling / instantiation AttributeErrors)
+# ─────────────────────────────────────────────────────────────────────────────
+class TabularPreprocessor:
+    def __init__(self):
+        self.label_encoders: dict[str, LabelEncoder] = {}
+        self.scaler        = StandardScaler()
+        self.fill_values   : dict[str, object]       = {}
+        self.cat_dims      : list[int]               = []
+        self.tab_dim       : int                     = 0
+
+    def transform(self, df: pd.DataFrame):
+        cat_parts, num_parts = [], []
+        for col in CFG.CAT_COLS:
+            series = df[col].astype(str).fillna(str(self.fill_values[col]))
+            le     = self.label_encoders[col]
+            codes  = series.map(lambda x, le=le: le.transform([x])[0] if x in le.classes_ else 0).values.astype(np.int64)
+            cat_parts.append(codes.reshape(-1, 1))
+        for col in CFG.NUM_COLS:
+            vals = df[col].fillna(self.fill_values[col]).values.reshape(-1, 1)
+            num_parts.append(vals)
+        cat_arr = np.hstack(cat_parts).astype(np.int64)
+        num_arr = self.scaler.transform(np.hstack(num_parts).astype(np.float32))
+        return cat_arr, num_arr
+
+class InceptionBase(nn.Module):
+    def __init__(self):
+        super().__init__()
+        base = inception_v3(weights=Inception_V3_Weights.DEFAULT); base.aux_logits = False
+        self.features = nn.Sequential(
+            base.Conv2d_1a_3x3, base.Conv2d_2a_3x3, base.Conv2d_2b_3x3, nn.MaxPool2d(3, stride=2),
+            base.Conv2d_3b_1x1, base.Conv2d_4a_3x3, nn.MaxPool2d(3, stride=2),
+            base.Mixed_5b, base.Mixed_5c, base.Mixed_5d, base.Mixed_6a, base.Mixed_6b,
+            base.Mixed_6c, base.Mixed_6d, base.Mixed_6e, base.Mixed_7a, base.Mixed_7b, base.Mixed_7c,
+        )
+    def forward(self, x): return self.features(x)
+
+class DiagnosisMultimodalNet(nn.Module):
+    def __init__(self, num_classes: int):
+        super().__init__()
+        f_dim = 2048
+        self.backbone_d, self.backbone_c = InceptionBase(), InceptionBase()
+        self.L_d_conv, self.L_c_conv = nn.Conv2d(f_dim, num_classes, 1), nn.Conv2d(f_dim, num_classes, 1)
+        self.bn_d, self.bn_c = nn.BatchNorm1d(f_dim), nn.BatchNorm1d(f_dim)
+        self.combine_visual = nn.Sequential(nn.Linear(f_dim * 2, CFG.R_DIM), nn.ReLU(), nn.BatchNorm1d(CFG.R_DIM))
+        self.L_dc_linear = nn.Linear(CFG.R_DIM, num_classes)
+    def forward(self, x_d, x_c):
+        feat_d, feat_c = self.backbone_d(x_d), self.backbone_c(x_c)
+        out_d = F.adaptive_avg_pool2d(self.L_d_conv(feat_d), (1, 1)).view(x_d.size(0), -1)
+        out_c = F.adaptive_avg_pool2d(self.L_c_conv(feat_c), (1, 1)).view(x_c.size(0), -1)
+        gap_d = F.adaptive_avg_pool2d(feat_d, (1, 1)).view(x_d.size(0), -1)
+        gap_c = F.adaptive_avg_pool2d(feat_c, (1, 1)).view(x_c.size(0), -1)
+        img_feat = self.combine_visual(torch.cat([self.bn_d(gap_d), self.bn_c(gap_c)], 1))
+        return out_d, out_c, self.L_dc_linear(img_feat), gap_d, gap_c, img_feat
+
+class FTTransformerEncoder(nn.Module):
+    def __init__(self, cat_dims: list[int], num_classes: int):
+        super().__init__()
+        self.cat_embeds = nn.ModuleList([nn.Embedding(dim + 1, CFG.EMB_DIM) for dim in cat_dims])
+        self.num_projectors = nn.ModuleList([nn.Linear(1, CFG.EMB_DIM) for _ in range(len(CFG.NUM_COLS))])
+        self.token_proj = nn.Linear(CFG.EMB_DIM, CFG.FT_HIDDEN)
+        self.pos_bias = nn.Parameter(torch.zeros(1, len(cat_dims) + len(CFG.NUM_COLS), CFG.FT_HIDDEN))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=CFG.FT_HIDDEN,
+            nhead=CFG.FT_HEADS,
+            dim_feedforward=CFG.FT_HIDDEN * 4,
+            dropout=CFG.FT_DROPOUT,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, CFG.FT_LAYERS)
+        self.norm, self.classifier = nn.LayerNorm(CFG.FT_HIDDEN), nn.Sequential(nn.Linear(CFG.FT_HIDDEN, CFG.FT_HIDDEN // 2), nn.GELU(), nn.Dropout(CFG.FT_DROPOUT), nn.Linear(CFG.FT_HIDDEN // 2, num_classes))
+        self.out_dim = CFG.FT_HIDDEN
+    def forward(self, x_cat: torch.Tensor, x_num: torch.Tensor):
+        tokens = [emb(x_cat[:, i].long()) for i, emb in enumerate(self.cat_embeds)] + [proj(x_num[:, i:i+1]) for i, proj in enumerate(self.num_projectors)]
+        x = self.token_proj(torch.stack(tokens, 1)) + self.pos_bias
+        tab_feat = self.norm(self.transformer(x).mean(1))
+        return self.classifier(tab_feat), tab_feat
+
+class CrossModalAttentionFusion(nn.Module):
+    def __init__(self, img_dim, tab_dim, num_classes):
+        super().__init__()
+        self.img_proj, self.tab_proj = nn.Sequential(nn.Linear(img_dim, CFG.D_MODEL), nn.LayerNorm(CFG.D_MODEL)), nn.Sequential(nn.Linear(tab_dim, CFG.D_MODEL), nn.LayerNorm(CFG.D_MODEL))
+        self.attn = nn.MultiheadAttention(CFG.D_MODEL, CFG.ATTN_HEADS, dropout=CFG.ATTN_DROPOUT, batch_first=True)
+        self.norm, self.dropout = nn.LayerNorm(CFG.D_MODEL), nn.Dropout(CFG.ATTN_DROPOUT)
+        self.classifier = nn.Sequential(nn.Linear(CFG.D_MODEL * 2, 256), nn.GELU(), nn.Dropout(0.2), nn.Linear(256, num_classes))
+        self.out_dim = CFG.D_MODEL * 2
+    def forward(self, img_feat, tab_feat):
+        B = img_feat.size(0)
+        tokens = torch.cat([self.img_proj(img_feat).unsqueeze(1), self.tab_proj(tab_feat).unsqueeze(1)], 1)
+        attn_out, _ = self.attn(tokens, tokens, tokens)
+        fused_feat = self.norm(tokens + self.dropout(attn_out)).view(B, -1)
+        return self.classifier(fused_feat), fused_feat
+
+class TripleCLIPHead(nn.Module):
+    def __init__(self, img_dim, tab_dim, fused_dim):
+        super().__init__()
+        def _make(in_dim): return nn.Sequential(nn.Linear(in_dim, 512), nn.GELU(), nn.Dropout(0.1), nn.Linear(512, CFG.CLIP_DIM))
+        self.proj_img, self.proj_tab, self.proj_fused = _make(img_dim), _make(tab_dim), _make(fused_dim)
+    def forward(self, img, tab, fused):
+        z_i, z_t, z_f = F.normalize(self.proj_img(img), dim=-1), F.normalize(self.proj_tab(tab), dim=-1), F.normalize(self.proj_fused(fused), dim=-1)
+        return (3.0 - (z_i*z_t).sum(1).mean() - (z_i*z_f).sum(1).mean() - (z_t*z_f).sum(1).mean()) / 3.0
+
+class ReliabilityHead(nn.Module):
+    def __init__(self, img_dim: int, tab_dim: int, hidden: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(img_dim + tab_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden, 3),
+        )
+    def forward(self, img_feat, tab_feat):
+        x = torch.cat([img_feat, tab_feat], dim=1)
+        logits = self.net(x)
+        p = F.softmax(logits, dim=1)
+        w_img = (p[:, 0] + p[:, 2]).unsqueeze(1)
+        w_tab = (p[:, 0] + p[:, 1]).unsqueeze(1)
+        return logits, w_img, w_tab
+
+class ReliabilityGatedModelV5(nn.Module):
+    def __init__(self, cat_dims, num_classes):
+        super().__init__()
+        self.num_classes = num_classes
+        self.net = DiagnosisMultimodalNet(num_classes)
+        self.ft_encoder = FTTransformerEncoder(cat_dims, num_classes)
+        tab_dim = self.ft_encoder.out_dim
+        self.fusion = CrossModalAttentionFusion(img_dim=CFG.R_DIM, tab_dim=tab_dim, num_classes=num_classes)
+        self.clip_head = TripleCLIPHead(img_dim=CFG.R_DIM, tab_dim=tab_dim, fused_dim=self.fusion.out_dim)
+        self.reliability = ReliabilityHead(img_dim=CFG.R_DIM, tab_dim=tab_dim)
+
+    def forward(self, derm, clinic, tab_cat, tab_num):
+        out_d, out_c, out_dc_raw, _, _, img_feat = self.net(derm, clinic)
+        out_tab_raw, tab_feat = self.ft_encoder(tab_cat, tab_num)
+        pert_logits, w_img, w_tab = self.reliability(img_feat, tab_feat)
+        img_feat_gated = img_feat * w_img
+        tab_feat_gated = tab_feat * w_tab
+        out_dc = out_dc_raw.clone()
+        out_tab = out_tab_raw.clone()
+        final_logits, fused_feat = self.fusion(img_feat_gated, tab_feat_gated)
+        clip_loss = self.clip_head(img_feat, tab_feat, fused_feat)
+        extras = dict(w_img=w_img, w_tab=w_tab, pert_logits=pert_logits)
+        return out_d, out_c, out_dc, out_tab, final_logits, clip_loss, extras
+
+class RepairedFusionModelV5(nn.Module):
+    def __init__(self, cat_dims, num_classes):
+        super().__init__()
+        self.net, self.ft_encoder = DiagnosisMultimodalNet(num_classes), FTTransformerEncoder(cat_dims, num_classes)
+        self.fusion = CrossModalAttentionFusion(CFG.R_DIM, self.ft_encoder.out_dim, num_classes)
+        self.clip_head = TripleCLIPHead(CFG.R_DIM, self.ft_encoder.out_dim, self.fusion.out_dim)
+    def forward(self, derm, clinic, tab_cat, tab_num):
+        out_d, out_c, out_dc, _, _, img_f = self.net(derm, clinic)
+        out_tab, tab_f = self.ft_encoder(tab_cat, tab_num)
+        final, _ = self.fusion(img_f, tab_f)
+        return out_d, out_c, out_dc, out_tab, final, None
+
+class DermWrapper(nn.Module):
+    def __init__(self, model, clinic_t, tab_cat_t, tab_num_t): super().__init__(); self.model, self.clinic_t, self.tab_cat_t, self.tab_num_t = model, clinic_t, tab_cat_t, tab_num_t
+    def forward(self, derm_t):
+        out = self.model(derm_t, self.clinic_t, self.tab_cat_t, self.tab_num_t)
+        return out[4] if len(out) >= 5 else out[-1]
+
+class ClinicWrapper(nn.Module):
+    def __init__(self, model, derm_t, tab_cat_t, tab_num_t): super().__init__(); self.model, self.derm_t, self.tab_cat_t, self.tab_num_t = model, derm_t, tab_cat_t, tab_num_t
+    def forward(self, clinic_t):
+        out = self.model(self.derm_t, clinic_t, self.tab_cat_t, self.tab_num_t)
+        return out[4] if len(out) >= 5 else out[-1]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GLOBAL CSS  — futuristic dark theme with scan-line texture
@@ -350,7 +503,7 @@ CAT_OPTIONS: dict[str, list] = {
 # SESSION STATE INIT — must happen before any widget reads
 # ─────────────────────────────────────────────────────────────────────────────
 _ss_defaults = {
-    "has_run":         False,   # has the user triggered at least one prediction?
+    "has_run":         False,   
     "_prev_blur":      0.0,
     "_prev_mask":      0,
     "_prev_gradcam":   False,
@@ -367,14 +520,12 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 
 @st.cache_data(show_spinner=False)
 def load_meta(path: Path) -> Optional[pd.DataFrame]:
-    """Load the metadata CSV."""
     if path.exists():
         return pd.read_csv(path)
     return None
 
 @st.cache_data(show_spinner=False)
 def load_test_indexes(path: Path) -> Optional[list]:
-    """Load the test indexes CSV."""
     if path.exists():
         return pd.read_csv(path).values.flatten().tolist()
     return None
@@ -398,7 +549,6 @@ def get_cat_index(col_name: str, row_val) -> int:
     return 0
 
 def get_cat_mode_idx(preprocessor, col_name: str) -> int:
-    """Helper to fetch the learned exact mode index from the preprocessor."""
     if preprocessor and col_name in preprocessor.fill_values and col_name in preprocessor.label_encoders:
         mode_val = str(preprocessor.fill_values[col_name])
         le = preprocessor.label_encoders[col_name]
@@ -407,7 +557,6 @@ def get_cat_mode_idx(preprocessor, col_name: str) -> int:
     return 0
 
 def merge_diagnosis_label(raw_diag: str) -> str:
-    """Maps meta.csv ground truth to one of the 5 model CLASSES."""
     if pd.isna(raw_diag): return "MISC"
     d = raw_diag.lower().strip()
 
@@ -465,30 +614,8 @@ def zero_image_tensor() -> torch.Tensor:
     return torch.zeros((1, 3, IMG_SIZE, IMG_SIZE))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPERS — tabular preprocessing
+# HELPERS — tabular loading
 # ─────────────────────────────────────────────────────────────────────────────
-class TabularPreprocessor:
-    def __init__(self):
-        self.label_encoders: dict[str, LabelEncoder] = {}
-        self.scaler        = StandardScaler()
-        self.fill_values   : dict[str, object]       = {}
-        self.cat_dims      : list[int]               = []
-        self.tab_dim       : int                     = 0
-
-    def transform(self, df: pd.DataFrame):
-        cat_parts, num_parts = [], []
-        for col in CFG.CAT_COLS:
-            series = df[col].astype(str).fillna(str(self.fill_values[col]))
-            le     = self.label_encoders[col]
-            codes  = series.map(lambda x, le=le: le.transform([x])[0] if x in le.classes_ else 0).values.astype(np.int64)
-            cat_parts.append(codes.reshape(-1, 1))
-        for col in CFG.NUM_COLS:
-            vals = df[col].fillna(self.fill_values[col]).values.reshape(-1, 1)
-            num_parts.append(vals)
-        cat_arr = np.hstack(cat_parts).astype(np.int64)
-        num_arr = self.scaler.transform(np.hstack(num_parts).astype(np.float32))
-        return cat_arr, num_arr
-
 @st.cache_resource(show_spinner=False)
 def load_preprocessor(path: Path):
     if not path.exists(): return None
@@ -501,144 +628,6 @@ def build_tab_tensors(cat_values: dict, num_values: dict, preprocessor) -> tuple
 
 def zero_tab_tensors() -> tuple[torch.Tensor, torch.Tensor]:
     return torch.zeros((1, len(CFG.CAT_COLS)), dtype=torch.long), torch.zeros((1, len(CFG.NUM_COLS)), dtype=torch.float32)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ARCHITECTURE — ReliabilityGatedModelV5 + Components
-# ─────────────────────────────────────────────────────────────────────────────
-class InceptionBase(nn.Module):
-    def __init__(self):
-        super().__init__()
-        base = inception_v3(weights=Inception_V3_Weights.DEFAULT); base.aux_logits = False
-        self.features = nn.Sequential(
-            base.Conv2d_1a_3x3, base.Conv2d_2a_3x3, base.Conv2d_2b_3x3, nn.MaxPool2d(3, stride=2),
-            base.Conv2d_3b_1x1, base.Conv2d_4a_3x3, nn.MaxPool2d(3, stride=2),
-            base.Mixed_5b, base.Mixed_5c, base.Mixed_5d, base.Mixed_6a, base.Mixed_6b,
-            base.Mixed_6c, base.Mixed_6d, base.Mixed_6e, base.Mixed_7a, base.Mixed_7b, base.Mixed_7c,
-        )
-    def forward(self, x): return self.features(x)
-
-class DiagnosisMultimodalNet(nn.Module):
-    def __init__(self, num_classes: int):
-        super().__init__()
-        f_dim = 2048
-        self.backbone_d, self.backbone_c = InceptionBase(), InceptionBase()
-        self.L_d_conv, self.L_c_conv = nn.Conv2d(f_dim, num_classes, 1), nn.Conv2d(f_dim, num_classes, 1)
-        self.bn_d, self.bn_c = nn.BatchNorm1d(f_dim), nn.BatchNorm1d(f_dim)
-        self.combine_visual = nn.Sequential(nn.Linear(f_dim * 2, CFG.R_DIM), nn.ReLU(), nn.BatchNorm1d(CFG.R_DIM))
-        self.L_dc_linear = nn.Linear(CFG.R_DIM, num_classes)
-    def forward(self, x_d, x_c):
-        feat_d, feat_c = self.backbone_d(x_d), self.backbone_c(x_c)
-        out_d = F.adaptive_avg_pool2d(self.L_d_conv(feat_d), (1, 1)).view(x_d.size(0), -1)
-        out_c = F.adaptive_avg_pool2d(self.L_c_conv(feat_c), (1, 1)).view(x_c.size(0), -1)
-        gap_d = F.adaptive_avg_pool2d(feat_d, (1, 1)).view(x_d.size(0), -1)
-        gap_c = F.adaptive_avg_pool2d(feat_c, (1, 1)).view(x_c.size(0), -1)
-        img_feat = self.combine_visual(torch.cat([self.bn_d(gap_d), self.bn_c(gap_c)], 1))
-        return out_d, out_c, self.L_dc_linear(img_feat), gap_d, gap_c, img_feat
-
-class FTTransformerEncoder(nn.Module):
-    def __init__(self, cat_dims: list[int], num_classes: int):
-        super().__init__()
-        self.cat_embeds = nn.ModuleList([nn.Embedding(dim + 1, CFG.EMB_DIM) for dim in cat_dims])
-        self.num_projectors = nn.ModuleList([nn.Linear(1, CFG.EMB_DIM) for _ in range(len(CFG.NUM_COLS))])
-        self.token_proj = nn.Linear(CFG.EMB_DIM, CFG.FT_HIDDEN)
-        self.pos_bias = nn.Parameter(torch.zeros(1, len(cat_dims) + len(CFG.NUM_COLS), CFG.FT_HIDDEN))
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=CFG.FT_HIDDEN,
-            nhead=CFG.FT_HEADS,
-            dim_feedforward=CFG.FT_HIDDEN * 4,
-            dropout=CFG.FT_DROPOUT,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, CFG.FT_LAYERS)
-        self.norm, self.classifier = nn.LayerNorm(CFG.FT_HIDDEN), nn.Sequential(nn.Linear(CFG.FT_HIDDEN, CFG.FT_HIDDEN // 2), nn.GELU(), nn.Dropout(CFG.FT_DROPOUT), nn.Linear(CFG.FT_HIDDEN // 2, num_classes))
-        self.out_dim = CFG.FT_HIDDEN
-    def forward(self, x_cat: torch.Tensor, x_num: torch.Tensor):
-        tokens = [emb(x_cat[:, i].long()) for i, emb in enumerate(self.cat_embeds)] + [proj(x_num[:, i:i+1]) for i, proj in enumerate(self.num_projectors)]
-        x = self.token_proj(torch.stack(tokens, 1)) + self.pos_bias
-        tab_feat = self.norm(self.transformer(x).mean(1))
-        return self.classifier(tab_feat), tab_feat
-
-class CrossModalAttentionFusion(nn.Module):
-    def __init__(self, img_dim, tab_dim, num_classes):
-        super().__init__()
-        self.img_proj, self.tab_proj = nn.Sequential(nn.Linear(img_dim, CFG.D_MODEL), nn.LayerNorm(CFG.D_MODEL)), nn.Sequential(nn.Linear(tab_dim, CFG.D_MODEL), nn.LayerNorm(CFG.D_MODEL))
-        self.attn = nn.MultiheadAttention(CFG.D_MODEL, CFG.ATTN_HEADS, dropout=CFG.ATTN_DROPOUT, batch_first=True)
-        self.norm, self.dropout = nn.LayerNorm(CFG.D_MODEL), nn.Dropout(CFG.ATTN_DROPOUT)
-        self.classifier = nn.Sequential(nn.Linear(CFG.D_MODEL * 2, 256), nn.GELU(), nn.Dropout(0.2), nn.Linear(256, num_classes))
-        self.out_dim = CFG.D_MODEL * 2
-    def forward(self, img_feat, tab_feat):
-        B = img_feat.size(0)
-        tokens = torch.cat([self.img_proj(img_feat).unsqueeze(1), self.tab_proj(tab_feat).unsqueeze(1)], 1)
-        attn_out, _ = self.attn(tokens, tokens, tokens)
-        fused_feat = self.norm(tokens + self.dropout(attn_out)).view(B, -1)
-        return self.classifier(fused_feat), fused_feat
-
-class TripleCLIPHead(nn.Module):
-    def __init__(self, img_dim, tab_dim, fused_dim):
-        super().__init__()
-        def _make(in_dim): return nn.Sequential(nn.Linear(in_dim, 512), nn.GELU(), nn.Dropout(0.1), nn.Linear(512, CFG.CLIP_DIM))
-        self.proj_img, self.proj_tab, self.proj_fused = _make(img_dim), _make(tab_dim), _make(fused_dim)
-    def forward(self, img, tab, fused):
-        z_i, z_t, z_f = F.normalize(self.proj_img(img), dim=-1), F.normalize(self.proj_tab(tab), dim=-1), F.normalize(self.proj_fused(fused), dim=-1)
-        return (3.0 - (z_i*z_t).sum(1).mean() - (z_i*z_f).sum(1).mean() - (z_t*z_f).sum(1).mean()) / 3.0
-
-class ReliabilityHead(nn.Module):
-    def __init__(self, img_dim: int, tab_dim: int, hidden: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(img_dim + tab_dim, hidden),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden, 3),
-        )
-    def forward(self, img_feat, tab_feat):
-        x = torch.cat([img_feat, tab_feat], dim=1)
-        logits = self.net(x)
-        p = F.softmax(logits, dim=1)
-        w_img = (p[:, 0] + p[:, 2]).unsqueeze(1)
-        w_tab = (p[:, 0] + p[:, 1]).unsqueeze(1)
-        return logits, w_img, w_tab
-
-class ReliabilityGatedModelV5(nn.Module):
-    def __init__(self, cat_dims, num_classes):
-        super().__init__()
-        self.num_classes = num_classes
-        self.net = DiagnosisMultimodalNet(num_classes)
-        self.ft_encoder = FTTransformerEncoder(cat_dims, num_classes)
-        tab_dim = self.ft_encoder.out_dim
-        self.fusion = CrossModalAttentionFusion(img_dim=CFG.R_DIM, tab_dim=tab_dim, num_classes=num_classes)
-        self.clip_head = TripleCLIPHead(img_dim=CFG.R_DIM, tab_dim=tab_dim, fused_dim=self.fusion.out_dim)
-        self.reliability = ReliabilityHead(img_dim=CFG.R_DIM, tab_dim=tab_dim)
-
-    def forward(self, derm, clinic, tab_cat, tab_num):
-        out_d, out_c, out_dc_raw, _, _, img_feat = self.net(derm, clinic)
-        out_tab_raw, tab_feat = self.ft_encoder(tab_cat, tab_num)
-        pert_logits, w_img, w_tab = self.reliability(img_feat, tab_feat)
-        img_feat_gated = img_feat * w_img
-        tab_feat_gated = tab_feat * w_tab
-        out_dc = out_dc_raw.clone()
-        out_tab = out_tab_raw.clone()
-        final_logits, fused_feat = self.fusion(img_feat_gated, tab_feat_gated)
-        clip_loss = self.clip_head(img_feat, tab_feat, fused_feat)
-        extras = dict(w_img=w_img, w_tab=w_tab, pert_logits=pert_logits)
-        return out_d, out_c, out_dc, out_tab, final_logits, clip_loss, extras
-
-class RepairedFusionModelV5(nn.Module):
-    def __init__(self, cat_dims, num_classes):
-        super().__init__()
-        self.net, self.ft_encoder = DiagnosisMultimodalNet(num_classes), FTTransformerEncoder(cat_dims, num_classes)
-        self.fusion = CrossModalAttentionFusion(CFG.R_DIM, self.ft_encoder.out_dim, num_classes)
-        self.clip_head = TripleCLIPHead(CFG.R_DIM, self.ft_encoder.out_dim, self.fusion.out_dim)
-    def forward(self, derm, clinic, tab_cat, tab_num):
-        out_d, out_c, out_dc, _, _, img_f = self.net(derm, clinic)
-        out_tab, tab_f = self.ft_encoder(tab_cat, tab_num)
-        final, _ = self.fusion(img_f, tab_f)
-        return out_d, out_c, out_dc, out_tab, final, None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS — loading & inference & interpretability
@@ -665,18 +654,6 @@ def load_model(path: Path):
         st.error(f"Model load failed from {path.name}: {exc}")
         return None
 
-class DermWrapper(nn.Module):
-    def __init__(self, model, clinic_t, tab_cat_t, tab_num_t): super().__init__(); self.model, self.clinic_t, self.tab_cat_t, self.tab_num_t = model, clinic_t, tab_cat_t, tab_num_t
-    def forward(self, derm_t):
-        out = self.model(derm_t, self.clinic_t, self.tab_cat_t, self.tab_num_t)
-        return out[4] if len(out) >= 5 else out[-1]
-
-class ClinicWrapper(nn.Module):
-    def __init__(self, model, derm_t, tab_cat_t, tab_num_t): super().__init__(); self.model, self.derm_t, self.tab_cat_t, self.tab_num_t = model, derm_t, tab_cat_t, tab_num_t
-    def forward(self, clinic_t):
-        out = self.model(self.derm_t, clinic_t, self.tab_cat_t, self.tab_num_t)
-        return out[4] if len(out) >= 5 else out[-1]
-
 def generate_gradcam(model, derm_t, clinic_t, tab_cat_t, tab_num_t, target_idx, modality="derm"):
     if not HAS_GRADCAM: return None
     model.eval()
@@ -687,7 +664,6 @@ def generate_gradcam(model, derm_t, clinic_t, tab_cat_t, tab_num_t, target_idx, 
 
 @torch.no_grad()
 def get_tabular_attention(model, derm_t, clinic_t, tab_cat_t, tab_num_t):
-    """Extracts self-attention weights from the final FT-Transformer layer."""
     ft = model.ft_encoder
     tokens = [emb(tab_cat_t[:, i].long()) for i, emb in enumerate(ft.cat_embeds)] + \
              [proj(tab_num_t[:, i:i+1]) for i, proj in enumerate(ft.num_projectors)]
@@ -778,8 +754,6 @@ with st.sidebar:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTO-RUN DETECTION
-# Fires a re-run whenever OOD sliders, the interpretability toggle, or the
-# modality radio change — but only after the user has manually run once.
 # ─────────────────────────────────────────────────────────────────────────────
 _param_changed = (
     st.session_state["_prev_blur"]     != blur_sigma     or
@@ -788,7 +762,6 @@ _param_changed = (
     st.session_state["_prev_modality"] != modality_mode
 )
 
-# Update stored values every cycle so we capture future deltas
 st.session_state["_prev_blur"]     = blur_sigma
 st.session_state["_prev_mask"]     = tab_mask_pct
 st.session_state["_prev_gradcam"]  = show_gradcam
@@ -829,13 +802,13 @@ with col_derm:
     st.markdown("<div class='section-label'>01 · DERMOSCOPY IMAGE</div>", unsafe_allow_html=True)
     selected_derm = get_image_path(DERM_DIR, selected_row["derm"]) if selected_row is not None else None
     if use_images and selected_derm and selected_derm.exists():
-        st.image(Image.open(selected_derm).convert("RGB"), use_container_width=True)
+        st.image(Image.open(selected_derm).convert("RGB"), width="stretch")
 
 with col_clinic:
     st.markdown("<div class='section-label'>02 · CLINICAL IMAGE</div>", unsafe_allow_html=True)
     selected_clinic = get_image_path(CLINIC_DIR, selected_row["clinic"]) if selected_row is not None else None
     if use_images and selected_clinic and selected_clinic.exists():
-        st.image(Image.open(selected_clinic).convert("RGB"), use_container_width=True)
+        st.image(Image.open(selected_clinic).convert("RGB"), width="stretch")
 
 with col_tab:
     st.markdown("<div class='section-label'>03 · TABULAR FEATURES</div>", unsafe_allow_html=True)
@@ -870,20 +843,17 @@ with col_tab:
         st.markdown(html, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RUN BUTTON — centred via equal flanking columns
+# RUN BUTTON 
 # ─────────────────────────────────────────────────────────────────────────────
 _left, _mid, _right = st.columns([2, 1, 2])
 with _mid:
-    run_clicked = st.button("⚡  RUN PREDICTION", key="run_btn", use_container_width=True)
+    run_clicked = st.button("⚡  RUN PREDICTION", key="run_btn", width="stretch")
 
-# Decide whether to actually run (manual click OR auto-run after first manual run)
 should_run = run_clicked or (st.session_state["has_run"] and _param_changed)
 
-# Mark that the user has run at least once
 if run_clicked:
     st.session_state["has_run"] = True
 
-# Determine active model
 is_ood       = blur_sigma > 0 or tab_mask_pct > 0
 active_model = model_ood if is_ood else model_full
 
@@ -900,7 +870,6 @@ if should_run:
     else:
         model_label = "Reliability-Gated OOD Model" if is_ood else "Standard Full Model"
         with st.spinner(f"Processing with {model_label}…"):
-            # ── Build tensors ─────────────────────────────────────────────────
             if use_images:
                 derm_t   = load_and_transform(selected_derm)   if (selected_derm   and selected_derm.exists())   else zero_image_tensor()
                 clinic_t = load_and_transform(selected_clinic) if (selected_clinic and selected_clinic.exists()) else zero_image_tensor()
@@ -912,7 +881,6 @@ if should_run:
                 if use_tabular else zero_tab_tensors()
             )
 
-            # ── Apply OOD perturbations ───────────────────────────────────────
             derm_p   = apply_gaussian_blur(derm_t,   blur_sigma) if use_images else derm_t
             clinic_p = apply_gaussian_blur(clinic_t, blur_sigma) if use_images else clinic_t
 
@@ -954,7 +922,6 @@ if should_run:
             unsafe_allow_html=True,
         )
 
-        # Ground truth comparison
         if selected_row is not None:
             actual  = merge_diagnosis_label(selected_row["diagnosis"])
             match   = "CORRECT" if actual == pred else "MISMATCH"
@@ -967,7 +934,6 @@ if should_run:
                 unsafe_allow_html=True,
             )
 
-        # Probability bars
         st.markdown("<div class='section-label'>PROBABILITY DISTRIBUTION</div>", unsafe_allow_html=True)
         prob_rows_html = ""
         for cls, p in sorted(probs.items(), key=lambda x: x[1], reverse=True):
@@ -982,7 +948,6 @@ if should_run:
             )
         st.markdown(prob_rows_html, unsafe_allow_html=True)
 
-        # ── Feature Explanations (standard + OOD) ────────────────────────────
         if show_gradcam:
             st.markdown("<div class='section-label'>👁️ MODEL ATTENTION & FEATURE IMPORTANCE</div>", unsafe_allow_html=True)
 
@@ -1005,7 +970,7 @@ if should_run:
                                 np.float32(Image.open(selected_derm).convert("RGB").resize((IMG_SIZE, IMG_SIZE))) / 255.0,
                                 cam_d, use_rgb=True,
                             ),
-                            caption="Dermoscopy Focus", use_container_width=True,
+                            caption="Dermoscopy Focus", width="stretch",
                         )
                 if selected_clinic and gc2:
                     cam_c = generate_gradcam(active_model, derm_p, clinic_p, tab_cat_p, tab_num_p, p_idx, "clinic")
@@ -1015,7 +980,7 @@ if should_run:
                                 np.float32(Image.open(selected_clinic).convert("RGB").resize((IMG_SIZE, IMG_SIZE))) / 255.0,
                                 cam_c, use_rgb=True,
                             ),
-                            caption="Clinical Focus", use_container_width=True,
+                            caption="Clinical Focus", width="stretch",
                         )
 
             if use_tabular and gc3 and active_model is not None:
@@ -1061,7 +1026,6 @@ if should_run:
                 unsafe_allow_html=True,
             )
 
-            # Feature table with masked cells highlighted
             table_html = (
                 "<table style='width:100%; border-collapse:collapse; text-align:center; "
                 "font-family:\"Share Tech Mono\",monospace; font-size:0.8rem; "
@@ -1084,7 +1048,6 @@ if should_run:
             table_html += "</tr></table>"
             st.markdown(table_html, unsafe_allow_html=True)
 
-            # Images + reliability bar chart
             r1, r2, r3 = st.columns([1, 1, 1.2])
             img_tag = "(Blurred)" if blur_sigma > 0 else "(Clean)"
 
@@ -1093,14 +1056,14 @@ if should_run:
                 unsafe_allow_html=True,
             )
             if use_images:
-                r1.image(tensor_to_image(derm_p), use_container_width=True)
+                r1.image(tensor_to_image(derm_p), width="stretch")
 
             r2.markdown(
                 f"<p style='text-align:center; color:#e0f7ff; font-family:\"Share Tech Mono\",monospace;'>Clinic Image {img_tag}</p>",
                 unsafe_allow_html=True,
             )
             if use_images:
-                r2.image(tensor_to_image(clinic_p), use_container_width=True)
+                r2.image(tensor_to_image(clinic_p), width="stretch")
 
             chart_html = textwrap.dedent(f"""
             <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; width:100%; height:100%;">
